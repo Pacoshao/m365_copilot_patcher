@@ -27,28 +27,27 @@ Object.defineProperty(window, '__staticRouterHydrationData',{
     myData.loaderData.root.store.eligibility.isCopilotEligible = true;
     myData.loaderData.root.store.eligibility.copilotAdminPinSetting = "Pinned";
     myData.loaderData.root.store.eligibility.acquisitionState = "acquired";
-    //这个不必改
-    // myData.loaderData.root.store.coreAppsContent = [
-    //                     {
-    //                         "id": "d870f6cd-4aa5-4d42-9626-ab690c041429",
-    //                         "label": "New chat",
-    //                         "path": "/chat"
-    //                     },
-    //                     {
-    //                         "id": "Search",
-    //                         "label": "Search",
-    //                         "path": "/search"
-    //                     },
-    //                     {
-    //                         "id": "Library",
-    //                         "label": "Library",
-    //                         "path": "/library"
-    //                     },
-    //                     {
-    //                         "id": "83d3f491-b586-4266-8738-89776471bf21",
-    //                         "label": "Create",
-    //                         "path": "/create"
-    //                     }
-    //                 ];
+    myData.loaderData.root.store.coreAppsContent = [
+                        {
+                            "id": "d870f6cd-4aa5-4d42-9626-ab690c041429",
+                            "label": "New chat",
+                            "path": "/chat"
+                        },
+                        {
+                            "id": "Search",
+                            "label": "Search",
+                            "path": "/search"
+                        },
+                        {
+                            "id": "Library",
+                            "label": "Library",
+                            "path": "/library"
+                        },
+                        {
+                            "id": "83d3f491-b586-4266-8738-89776471bf21",
+                            "label": "Create",
+                            "path": "/create"
+                        }
+                    ];
   }
 });
