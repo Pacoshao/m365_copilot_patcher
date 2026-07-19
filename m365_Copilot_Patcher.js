@@ -4,38 +4,92 @@
 // @match       https://m365.cloud.microsoft/*
 // @grant       none
 // @run-at      document-start
-// @version     1.1
+// @version     1.2
 // @author      Pacoshao
-// @description 3/15/2026, 7:54 PM
+// @description 7/19/2026
 // ==/UserScript==
 //
 
-let myData = window.__staticRouterHydrationData;
 
-Object.defineProperty(window, '__staticRouterHydrationData',{
-  enumerable: true,
-  configurable: true, // 允许后续再次修改
-  get() {
-    console.log('正在读取 __staticRouterHydrationData');
-    //console.log(myData);
-    return myData;
-  },
-  set(value) {
-    console.log('正在设置 __staticRouterHydrationData', value);
-    myData = value;
-    myData.loaderData.root.store.eligibility.isCopilotEnabledRegion = true;
-    myData.loaderData.root.store.eligibility.isCopilotEligible = true;
-    myData.loaderData.root.store.eligibility.copilotAdminPinSetting = "Pinned";
-    myData.loaderData.root.store.eligibility.acquisitionState = "acquired";
-    const existing = myData.loaderData.root.store.coreAppsContent ?? [];
+(function () {
+    function patchData(data) {
+        if (!data?.loaderData?.root?.store) {
+            return;
+        }
 
-    const toAdd = [
-        { id: "d870f6cd-4aa5-4d42-9626-ab690c041429", label: "New chat", path: "/chat" },
-        { id: "Search", label: "Search", path: "/search" },
-        { id: "Library", label: "Library", path: "/library" },
-        { id: "83d3f491-b586-4266-8738-89776471bf21", label: "Create", path: "/create" }
-    ].filter(item => !existing.some(e => e.label == item.label));
+        const store = data.loaderData.root.store;
 
-    myData.loaderData.root.store.coreAppsContent = [...existing, ...toAdd];
-  }
-});
+        if (store.eligibility) {
+            store.eligibility.isCopilotEnabledRegion = true;
+            store.eligibility.isCopilotEligible = true;
+            store.eligibility.acquisitionState = "acquired";
+        }
+
+        const existing = store.coreAppsContent || [];
+
+        const toAdd = [
+            {
+                "id": "d870f6cd-4aa5-4d42-9626-ab690c041429",
+                "label": "New chat",
+                "path": "/chat",
+                "iconSrc": "https://res.public.onecdn.static.microsoft/midgard/versionless-v2/m365copilotresources/apps/bebop-chats.svg",
+                "selectedIconSrc": "https://res.public.onecdn.static.microsoft/midgard/versionless-v2/m365copilotresources/apps/bebop-chats-filled.svg",
+                "coloredSelectedIcon": false
+            },
+            {
+                "id": "Search",
+                "label": "Search",
+                "path": "/search",
+                "iconSrc": "https://res.public.onecdn.static.microsoft/midgard/versionless-v2/m365copilotresources/apps/search.svg",
+                "selectedIconSrc": "https://res.public.onecdn.static.microsoft/midgard/versionless-v2/m365copilotresources/apps/bebop-search-filled.svg",
+                "coloredSelectedIcon": false
+            },
+            {
+                "id": "Library",
+                "label": "Library",
+                "path": "/library",
+                "iconSrc": "https://res.public.onecdn.static.microsoft/midgard/versionless-v2/m365copilotresources/apps/library.svg",
+                "selectedIconSrc": "https://res.public.onecdn.static.microsoft/midgard/versionless-v2/m365copilotresources/apps/bebop-library-filled.svg",
+                "coloredSelectedIcon": false
+            }
+        ].filter(
+            item => !existing.some(
+                e => e.label === item.label
+            )
+        );
+
+        store.coreAppsContent = [
+            ...existing,
+            ...toAdd
+        ];
+    }
+
+    let currentData = window.__staticRouterHydrationData;
+
+    if (currentData) {
+        patchData(currentData);
+    }
+
+    Object.defineProperty(
+        window,
+        "__staticRouterHydrationData",
+        {
+            configurable: true,
+            enumerable: true,
+
+            get() {
+                return currentData;
+            },
+
+            set(value) {
+                currentData = value;
+
+                try {
+                    patchData(currentData);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+        }
+    );
+})();
