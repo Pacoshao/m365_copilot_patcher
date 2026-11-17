@@ -65,9 +65,11 @@
     var sleep = function (ms) { return new Promise(function (r) { setTimeout(r, ms); }); };
 
     var runtime = {
-        applying: false,     // 正在程序化恢复，期间不要记录为用户操作
-        restored: false,     // 本次页面已尝试过恢复
-        lastSeen: null,      // 上一次观察到的按钮显示名
+        applying: false,          // 正在程序化恢复，期间不要记录为用户操作
+        dirty: false,             // 页面已进入可交互（输入框所在界面已渲染）
+        restoreAttempted: false,  // 本页已尝试过恢复（无论有没有偏好）
+        restored: false,          // 是否真的恢复了某个偏好
+        lastSeen: null,           // 上一次观察到的按钮显示名
         clicks: 0
     };
 
@@ -346,9 +348,14 @@
     }
 
     function recordIfChanged() {
-        // 首次恢复还没跑完时不要记录：那一瞬间按钮显示的是默认的「自动」，
-        // 记下去会覆盖掉用户真正的偏好，导致下次永远恢复不了。
-        if (!runtime.restored || runtime.applying) { return; }
+        // 程序化恢复期间不要记录
+        if (runtime.applying) { return; }
+        // 本页第一次动手恢复之前不要记录：那时按钮显示的还是默认的「自动」，
+        // 记下去会让偏好永远停在「自动」。注意这里看的是「是否已尝试过恢复」，
+        // 而不是「是否真的有偏好」——没有偏好时也必须立刻开始正常记录，
+        // 否则用户第一次手动选模型永远记不下来。
+        if (runtime.dirty && !runtime.restoreAttempted) { return; }
+
         var label = currentLabel();
         if (!label || label === runtime.lastSeen) { return; }
         runtime.lastSeen = label;
@@ -365,13 +372,16 @@
     }
 
     async function restoreOnce() {
-        if (runtime.restored) { return; }
+        // 每一页只尝试一次
+        if (runtime.restoreAttempted) { return; }
         var pref = loadPref();
-        if (!pref) { return; }
         var label = await waitFor(function () { return currentLabel(); }, 20000);
         if (!label) { return; }
-        runtime.restored = true;
+        // 关键：即使没有偏好，也要把「已尝试恢复」置真，
+        // 这样后面的监听才能正常记录用户的选择。
+        runtime.restoreAttempted = true;
         runtime.lastSeen = label;
+        if (!pref) { runtime.restored = true; return; }
         if (label === norm(pref.label)) {
             log("当前已是上次选择的模型：" + label);
             return;
@@ -384,6 +394,8 @@
     /* ---------------------- 启动 ---------------------- */
 
     function boot() {
+        // 标记进入可交互状态，允许记录用户操作
+        runtime.dirty = true;
         restoreOnce();
         setInterval(recordIfChanged, OPTIONS.watchMs);
         setInterval(function () { restoreOnce(); }, 2000);
