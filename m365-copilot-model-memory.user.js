@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         M365 Copilot 记住模型选择
 // @namespace    https://github.com/Pacoshao/m365-copilot-region-unlock
-// @version      1.0.1
+// @version      1.0.0
 // @description  让 Microsoft 365 Copilot 记住你上次选的模型，而不是每次刷新都回到「自动」
 // @author       Pacoshao
 // @match        https://m365.cloud.microsoft/*
