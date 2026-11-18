@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         M365 Copilot 区域限制解除
-// @namespace    https://github.com/Pacoshao/m365-copilot-region-unlock
-// @version      2.0.0
-// @description  解除 Microsoft 365 Copilot / Copilot 的区域限制，让 m365.cloud.microsoft 与 copilot.cloud.microsoft 的 /chat 在受限地区可用
+// @namespace    https://github.com/Pacoshao/m365_copilot_patcher
+// @version      3.0.0
+// @description  解除 Microsoft 365 Copilot 的区域限制，让 m365.cloud.microsoft 与 copilot.cloud.microsoft 的聊天界面在受限地区可用
 // @author       Pacoshao
 // @match        https://m365.cloud.microsoft/*
 // @match        https://copilot.cloud.microsoft/*
@@ -12,29 +12,31 @@
 // ==/UserScript==
 
 /*
- * 原理（2026-11 版站点）
- * ------------------------------------------------------------------
- * 当前站点已从 React Router 的 window.__staticRouterHydrationData 迁移到
- * TanStack Router：真正的应用状态挂在 window.__TSR_ROUTER__ 的路由 context 里，
- * 是一个 zustand store：
+ * 原理（2026-11-18 版站点）
+ * ==================================================================
+ * 区域受限时，站点不再停在「Copilot Chat 不可用」页，而是直接整页跳转
+ * 到搜索页 /search。跳转来自 TanStack 路由守卫：它在 hydration 阶段发现
+ * 账号不合格，就抛一个 307 重定向出去。
  *
- *   __TSR_ROUTER__.state.matches[i].context.store.getState()
+ * 关键点：决定资格的并不是下面这两处，改了也没用——
+ *   - zustand store（__TSR_ROUTER__ 里的 store）：出现得太晚，守卫早跑完了
+ *   - window.__staticRouterHydrationData：实测改了照样被踢走
  *
- * 其中决定「区域限制」的字段只有两个：
- *   store.getState().eligibility.isCopilotEnabledRegion   // 账号所在区域是否开放
- *   store.getState().eligibility.isCopilotEligible        // 当前账号是否具备 Copilot 资格
+ * 真正被守卫读取的，是 SSR 直接内联下发的那段 streamed 路由载荷：
  *
- * 命中时站点会 SPA 跳到 /chat/blocked，并渲染「Copilot Chat 在你所在的区域不可用」。
+ *   <script>self.$_TSR={...}</script>
+ *   <script>$_TSR.router=($R=>($R[0]={manifest:...,matches:...,dehydratedData:...}))(...)</script>
  *
- * 实测结论（已在真实受限账号上验证）：
- *   只把 isCopilotEnabledRegion 改成 true —— 仍然停在 /chat/blocked，聊天不可用；
- *   同时把 isCopilotEligible 改成 true   —— 直接进入 /home，输入框可用，
- *                                          能正常收发消息（服务端不做区域拦截）。
+ * 所以本脚本的核心是在 document-start 阶段把 window.$_TSR 改成访问器，
+ * 等站点给它赋 router 的那一刻，直接深挖整棵载荷对象，把
+ * eligibility / appsConfig 里和区域相关的开关就地改成可用值。
+ * 这样守卫拿到的就已经是放行后的数据，根本不会跳转。
  *
- * 所以本脚本在 document-start 阶段就开始轮询路由器 store，一旦发现处于受限状态，
- * 就通过 store.setState() 把这两个字段（以及被一并联锁关闭的 appsConfig 开关）
- * 改写为可用值。之后若站点重新拉取资格数据把值刷回去，会在下一轮轮询里再次修正。
- * ------------------------------------------------------------------
+ * 载荷里实际存在的字段（实测）：
+ *   x.eligibility.isCopilotEnabledRegion   // 区域是否开放
+ *   x.eligibility.isCopilotEligible        // 账号是否具备资格
+ *   x.appsConfig.isChatEligible            // 聊天入口开关
+ * ==================================================================
  */
 
 (function () {
@@ -56,7 +58,10 @@
             "isAgentsEnabled"
         ],
 
-        // 启动阶段高频轮询，覆盖 SSR 水合 / 首屏路由判定
+        // 载荷深挖的最大深度
+        graphMaxDepth: 8,
+
+        // 启动阶段高频轮询，覆盖水合 / 首屏路由判定
         fastPollMs: 16,
         fastPollDurationMs: 30000,
 
@@ -68,29 +73,20 @@
         // 连「新建聊天」都没有；这里的条目会被合并进 store，站点随即渲染出来。
         completeNav: true,
 
-        // 需要补全的导航项。id 取自站点自己的导航枚举，
-        // 图标地址全部为线上实际存在的官方资源（逐个探测过）。
-        // 站点的导航渲染规则（实测）：label 长度 <= 1 时，它认为这是个 key，
-        // 会拿 id 去查自己的本地化文案；label 更长时则原样显示 label。
-        //
-        // 所以这里分两类：
-        //   lookup=true  → label 只给一个占位字符，交给站点按 id 查官方文案
-        //                  （Projects 会显示成「工作区」、Library 显示成「库」）
-        //   lookup=false → 用完整 label 直接显示（chat 没有官方文案，必须自己给）
+        // 需要补全的导航项。
+        // 站点的渲染规则（实测）：label 只有 1 个字符时，它把这当作 key，
+        // 会拿 id 去查自己的本地化文案；label 更长时则原样显示。
         navItems: [
             // chat 不能沿用官方那个 id：站点会认出它并套用自己的文案，
-            // 而该文案在中文界面下会被渲染成单个「新」字。
-            // 换一个普通 id + 显式 label，就能正常显示「新建聊天」。
-            { key: "chat", id: "M365CopilotNewChat", lookup: false,
-              label: "New chat", labelZh: "新建聊天", path: "/chat",
-              icon: "bebop-chats.svg", iconFilled: "bebop-chats-filled.svg" },
-            { key: "library", id: "Library", lookup: true, label: "L", labelZh: "L", path: "/library",
-              icon: "library.svg", iconFilled: "bebop-library-filled.svg" },
-            { key: "projects", id: "Projects", lookup: true, label: "P", labelZh: "P", path: "/projects",
-              icon: "bebop-projects.svg", iconFilled: "bebop-projects-filled.svg" },
-            { key: "agents", id: "Agents", lookup: false,
-              label: "Agents", labelZh: "智能体", path: "/agents",
-              icon: "bebop-tasks.svg", iconFilled: "bebop-agents-filled.svg" }
+            // 而该文案在中文界面下会被截成单个「新」字。
+            { key: "chat", id: "M365CopilotNewChat", label: "New chat", labelZh: "新建聊天",
+              path: "/chat", icon: "bebop-chats.svg", iconFilled: "bebop-chats-filled.svg" },
+            { key: "library", id: "Library", label: "L", labelZh: "L",
+              path: "/library", icon: "library.svg", iconFilled: "bebop-library-filled.svg" },
+            { key: "projects", id: "Projects", label: "P", labelZh: "P",
+              path: "/projects", icon: "bebop-projects.svg", iconFilled: "bebop-projects-filled.svg" },
+            { key: "agents", id: "Agents", label: "Agents", labelZh: "智能体",
+              path: "/agents", icon: "bebop-tasks.svg", iconFilled: "bebop-agents-filled.svg" }
         ],
 
         // 官方图标根地址
@@ -104,7 +100,10 @@
     var TAG = "[M365区域解锁]";
     var state = {
         engaged: false,     // 是否已经判定为「受限」，判过一次就一直维持
-        patched: 0,         // 累计修补次数
+        patched: 0,         // store 级修补次数
+        navPatched: 0,      // 导航补全次数
+        payloadHits: 0,     // 载荷深挖命中的 eligibility 数
+        payloadPatched: 0,  // 载荷实际修改次数
         lastHook: null
     };
 
@@ -128,7 +127,157 @@
         return target;
     }
 
-    /* ---------------------- 判定与修补 ---------------------- */
+    /* ---------------------- 字段修补 ---------------------- */
+
+    var ELIG_PATCH = {
+        isCopilotEnabledRegion: true,
+        isCopilotEligible: true,
+        isOptedOutByAdmin: false,
+        isError: false
+    };
+
+    function buildAppsPatch(current) {
+        var out = {};
+        if (!current) { return out; }
+        for (var i = 0; i < OPTIONS.unlockApps.length; i++) {
+            var k = OPTIONS.unlockApps[i];
+            if (k in current) { out[k] = true; }
+        }
+        return out;
+    }
+
+    // 是不是一个「受限」的 eligibility 对象
+    function looksBlocked(e) {
+        return !!e && (e.isCopilotEnabledRegion === false || e.isCopilotEligible === false);
+    }
+
+    function applyToEligibility(e) {
+        if (!e || typeof e !== "object") { return false; }
+        if (e.isCopilotEnabledRegion === true && e.isCopilotEligible === true) { return false; }
+        var keys = Object.keys(ELIG_PATCH);
+        for (var i = 0; i < keys.length; i++) {
+            if (e[keys[i]] !== ELIG_PATCH[keys[i]]) { e[keys[i]] = ELIG_PATCH[keys[i]]; }
+        }
+        return true;
+    }
+
+    function applyToAppsConfig(a) {
+        if (!a || typeof a !== "object") { return false; }
+        var patch = buildAppsPatch(a);
+        var changed = false;
+        for (var k in patch) {
+            if (Object.prototype.hasOwnProperty.call(patch, k) && a[k] !== true) { a[k] = true; changed = true; }
+        }
+        return changed;
+    }
+
+    /* ---------------------- 载荷深挖 ---------------------- */
+
+    // 就地遍历整棵 SSR 载荷，命中 eligibility / appsConfig 就修
+    function patchGraph(root) {
+        if (!root || typeof root !== "object") { return 0; }
+        var seen = new WeakSet();
+        var changed = 0;
+
+        function walk(o, depth) {
+            if (!o || typeof o !== "object" || depth > OPTIONS.graphMaxDepth || seen.has(o)) { return; }
+            seen.add(o);
+
+            try {
+                var e = o.eligibility;
+                if (e && typeof e === "object") {
+                    state.payloadHits++;
+                    if (looksBlocked(e)) { state.engaged = true; }
+                    if (state.engaged && applyToEligibility(e)) {
+                        changed++;
+                        state.payloadPatched++;
+                    }
+                }
+                var a = o.appsConfig;
+                if (a && typeof a === "object" && state.engaged) {
+                    if (applyToAppsConfig(a)) { changed++; }
+                }
+            } catch (err) { /* ignore */ }
+
+            var keys;
+            try { keys = Object.keys(o); } catch (err) { return; }
+            for (var i = 0; i < keys.length; i++) {
+                var v;
+                try { v = o[keys[i]]; } catch (err) { continue; }
+                if (v && typeof v === "object") { walk(v, depth + 1); }
+            }
+        }
+
+        walk(root, 0);
+        return changed;
+    }
+
+    /* ---------------------- 主钩子：$_TSR streamed 载荷 ---------------------- */
+
+    // 站点给 window.$_TSR 赋值时包一层 Proxy，
+    // 等它紧接着执行 $_TSR.router = (...) 时立即修补载荷。
+    function installTsrHook() {
+        try {
+            if (Object.prototype.hasOwnProperty.call(W, "$_TSR")) {
+                // 已经被站点先赋值了（正常不会发生，document-start 应该更早）
+                try { patchGraph(W.$_TSR); } catch (e) { /* ignore */ }
+                state.lastHook = "tsr-existing";
+                return;
+            }
+            var real;
+            Object.defineProperty(W, "$_TSR", {
+                configurable: true,
+                enumerable: true,
+                get: function () { return real; },
+                set: function (v) {
+                    try {
+                        real = new Proxy(v, {
+                            set: function (target, key, value) {
+                                if (key === "router") {
+                                    try {
+                                        var n = patchGraph(value);
+                                        if (n) {
+                                            console.info(TAG, "已在路由载荷里解除区域限制（修补 " + n + " 处）");
+                                        }
+                                    } catch (e) { /* ignore */ }
+                                }
+                                target[key] = value;
+                                return true;
+                            }
+                        });
+                    } catch (e) {
+                        real = v;
+                    }
+                }
+            });
+            state.lastHook = "tsr";
+        } catch (e) {
+            state.lastHook = "tsr-failed";
+        }
+    }
+
+    /* ---------------------- 兜底钩子：老的 React Router 水合数据 ---------------------- */
+
+    function installHydrationHook() {
+        try {
+            var current = W.__staticRouterHydrationData;
+            if (current) { patchGraph(current); }
+            Object.defineProperty(W, "__staticRouterHydrationData", {
+                configurable: true,
+                enumerable: true,
+                get: function () { return current; },
+                set: function (value) {
+                    current = value;
+                    try { patchGraph(value); } catch (e) { /* ignore */ }
+                }
+            });
+            if (!state.lastHook) { state.lastHook = "hydration"; }
+        } catch (e) {
+            if (!state.lastHook) { state.lastHook = "hydration-failed"; }
+        }
+    }
+
+    /* ---------------------- store 级修补（导航补全也在这里） ---------------------- */
 
     function readState(store) {
         if (!store) { return null; }
@@ -138,10 +287,9 @@
         return store;
     }
 
-    // 已经处于完全可用状态？
-    function isUnlocked(s) {
-        var e = s.eligibility;
-        if (!e || e.isCopilotEnabledRegion !== true || e.isCopilotEligible !== true) { return false; }
+    function isUnlockedState(s) {
+        if (!s || !s.eligibility) { return false; }
+        if (looksBlocked(s.eligibility)) { return false; }
         var a = s.appsConfig;
         if (a) {
             for (var i = 0; i < OPTIONS.unlockApps.length; i++) {
@@ -152,98 +300,19 @@
         return true;
     }
 
-    // 是否需要介入
-    function shouldEngage(s) {
+    function shouldEngageState(s) {
         if (state.engaged) { return true; }
         if (!OPTIONS.engageOnlyWhenRegionBlocked) { return true; }
         try {
             if (location.pathname.indexOf("/chat/blocked") !== -1) { return true; }
         } catch (e) { /* ignore */ }
-        var e = s.eligibility;
-        return !!e && e.isCopilotEnabledRegion === false;
+        return looksBlocked(s.eligibility);
     }
 
-    function buildPatch() {
-        var elig = {
-            isCopilotEnabledRegion: true,
-            isCopilotEligible: true,
-            isOptedOutByAdmin: false,
-            isError: false
-        };
-        var apps = {};
-        return { elig: elig, apps: apps };
-    }
-
-    function applyTo(store) {
-        var s = readState(store);
-        if (!s || !s.eligibility) { return; }
-        if (!shouldEngage(s)) { return; }
-        state.engaged = true;
-
-        // 先校验导航：解锁之后这个函数会被上面的 isUnlocked 提前 return 掉，
-        // 所以补全不能再依赖它——每次轮询都跑一遍，缺了就补。
-        try { completeNav(store); } catch (e) { /* ignore */ }
-
-        if (isUnlocked(s)) { return; }
-
-        var patch = buildPatch();
-        var a = s.appsConfig;
-        if (a) {
-            for (var i = 0; i < OPTIONS.unlockApps.length; i++) {
-                var k = OPTIONS.unlockApps[i];
-                if (k in a) { patch.apps[k] = true; }
-            }
-        }
-
-        // 首选：走 zustand 的 setState（浅合并），不会打乱 React 的订阅
-        var ok = false;
-        if (typeof store.setState === "function") {
-            try {
-                store.setState(function (prev) {
-                    var next = { eligibility: assign({}, prev.eligibility, patch.elig) };
-                    if (prev.appsConfig) {
-                        next.appsConfig = assign({}, prev.appsConfig, patch.apps);
-                    }
-                    return next;
-                });
-                ok = true;
-            } catch (e) {
-                ok = false;
-            }
-        }
-
-        // 兜底：直接就地改字段（站点若换掉 store 实现仍然有效）
-        if (!ok || !isUnlocked(readState(store) || s)) {
-            try {
-                var cur = readState(store) || s;
-                if (cur.eligibility) { assign(cur.eligibility, patch.elig); }
-                if (cur.appsConfig) { assign(cur.appsConfig, patch.apps); }
-            } catch (e) { /* ignore */ }
-        }
-
-        state.patched++;
-        if (state.patched === 1) {
-            try { console.info(TAG, "已解除 Copilot 区域限制，正在进入聊天主页"); } catch (e) { /* ignore */ }
-        } else {
-            log("再次修正资格状态，第 " + state.patched + " 次");
-        }
-    }
-
-    /* ---------------------- 补全左侧导航 ---------------------- */
-
-    // 区域受限账号拿到的 coreAppsContent 只有 Search / Plugins，
-    // 「新建聊天」、库、项目、智能体等入口都不会下发。
-    // 这里按站点自己的数据结构把缺的项补上，站点随即渲染出来。
-    var navDone = false;
-
-    function completeNav(store) {
-        // 每次轮询都校验一遍：站点重新拉取数据、或路由切换重建了
-        // coreAppsContent 时，缺的项会被自动补回。
-        // 已经存在时 added 为空，不会触发多余的 setState。
+    // 补全左侧导航
+    function completeNav(store, s) {
         if (!OPTIONS.completeNav) { return; }
-        var s = readState(store);
-        if (!s || !Array.isArray(s.coreAppsContent)) { return; }
-        if (!isUnlocked(s)) { return; }
+        if (!Array.isArray(s.coreAppsContent)) { return; }
 
         var have = {};
         for (var i = 0; i < s.coreAppsContent.length; i++) {
@@ -258,7 +327,6 @@
             if (have[def.id]) { continue; }
             added.push({
                 id: def.id,
-                // label 只有 1 个字符时站点会改用自己的本地化文案，详见 OPTIONS.navItems 注释
                 label: (zh && def.labelZh) ? def.labelZh : def.label,
                 path: def.path,
                 iconSrc: OPTIONS.iconBase + def.icon,
@@ -266,39 +334,55 @@
                 coloredSelectedIcon: false
             });
         }
-        if (!added.length) { navDone = true; return; }
+        if (!added.length) { return; }
 
         if (typeof store.setState === "function") {
             store.setState(function (prev) {
                 return { coreAppsContent: added.concat(prev.coreAppsContent || []) };
             });
-        } else if (Array.isArray(s.coreAppsContent)) {
+        } else {
             s.coreAppsContent = added.concat(s.coreAppsContent);
         }
-        navDone = true;
-        log("已补全导航入口：" + added.map(function (a) { return a.label; }).join("、"));
+        state.navPatched++;
+        log("已补全导航入口：" + added.map(function (x) { return x.label; }).join("、"));
     }
 
-    // 处理 SSR 直接下发的纯对象（没有 setState 的场景）
-    function applyToPlain(plainStore) {
-        if (!plainStore || !plainStore.eligibility) { return; }
-        if (!shouldEngage(plainStore)) { return; }
+    function applyToStore(store) {
+        var s = readState(store);
+        if (!s || !s.eligibility) { return; }
+        if (!shouldEngageState(s)) { return; }
         state.engaged = true;
-        if (isUnlocked(plainStore)) { return; }
-        var patch = buildPatch();
-        if (plainStore.appsConfig) {
-            var a = plainStore.appsConfig;
-            for (var i = 0; i < OPTIONS.unlockApps.length; i++) {
-                var k = OPTIONS.unlockApps[i];
-                if (k in a) { patch.apps[k] = true; }
-            }
-            assign(a, patch.apps);
-        }
-        assign(plainStore.eligibility, patch.elig);
-        log("已修补 SSR 下发数据");
-    }
 
-    /* ---------------------- 定位 store ---------------------- */
+        // 先校验导航：资格修好之后下面的逻辑会提前返回，补充不能依赖它
+        try { completeNav(store, s); } catch (e) { /* ignore */ }
+
+        if (isUnlockedState(s)) { return; }
+
+        var elig = assign({}, s.eligibility, ELIG_PATCH);
+        var apps = s.appsConfig ? assign({}, s.appsConfig, buildAppsPatch(s.appsConfig)) : null;
+
+        var ok = false;
+        if (typeof store.setState === "function") {
+            try {
+                store.setState(function (prev) {
+                    var next = { eligibility: assign({}, prev.eligibility, ELIG_PATCH) };
+                    if (prev.appsConfig) { next.appsConfig = assign({}, prev.appsConfig, buildAppsPatch(prev.appsConfig)); }
+                    return next;
+                });
+                ok = true;
+            } catch (e) { ok = false; }
+        }
+        if (!ok) {
+            try {
+                assign(s.eligibility, ELIG_PATCH);
+                if (s.appsConfig) { assign(s.appsConfig, buildAppsPatch(s.appsConfig)); }
+            } catch (e) { /* ignore */ }
+        }
+        state.patched++;
+        if (state.patched === 1) {
+            try { console.info(TAG, "已解除 Copilot 区域限制"); } catch (e) { /* ignore */ }
+        }
+    }
 
     function scanRouter() {
         var router = W.__TSR_ROUTER__;
@@ -308,60 +392,28 @@
         for (var i = 0; i < matches.length; i++) {
             var ctx = matches[i] && matches[i].context;
             if (ctx && ctx.store) {
-                applyTo(ctx.store);
+                try { applyToStore(ctx.store); } catch (e) { /* ignore */ }
                 hit = true;
             }
         }
         return hit;
     }
 
-    /* ---------------------- SSR 水合兜底 ---------------------- */
+    /* ---------------------- 启动 ---------------------- */
 
-    // 站点当前版本基本不再读它，但保留一层防御：
-    // 老版本 / 其他构建若仍然通过 window.__staticRouterHydrationData 下发，
-    // 这里会在赋值瞬间把 eligibility 修好。
-    try {
-        var current = W.__staticRouterHydrationData;
-        if (current) { applyToPlain(current.loaderData && current.loaderData.root && current.loaderData.root.store); }
-        Object.defineProperty(W, "__staticRouterHydrationData", {
-            configurable: true,
-            enumerable: true,
-            get: function () { return current; },
-            set: function (value) {
-                current = value;
-                try {
-                    var st = value && value.loaderData && value.loaderData.root && value.loaderData.root.store;
-                    if (st) { applyToPlain(st); }
-                } catch (e) { /* ignore */ }
-            }
-        });
-        state.lastHook = "defineProperty";
-    } catch (e) {
-        state.lastHook = "unavailable";
-    }
-
-    /* ---------------------- 轮询循环 ---------------------- */
+    installTsrHook();
+    installHydrationHook();
 
     var startedAt = Date.now();
-    var timer = null;
-
     function tick() {
         var hit = false;
         try { hit = scanRouter(); } catch (e) { /* ignore */ }
-
-        var elapsed = Date.now() - startedAt;
-        var fast = elapsed < OPTIONS.fastPollDurationMs;
-        var delay = fast ? OPTIONS.fastPollMs : OPTIONS.slowPollMs;
-
-        // 首屏还没挂上 router 时加速探测
-        if (!hit && !fast) { delay = 100; }
-
-        timer = setTimeout(tick, delay);
+        var fast = (Date.now() - startedAt) < OPTIONS.fastPollDurationMs;
+        var delay = fast ? OPTIONS.fastPollMs : (hit ? OPTIONS.slowPollMs : 100);
+        setTimeout(tick, delay);
     }
-
     tick();
 
-    // 单页应用切回标签页 / 前进后退时补一次
     try {
         document.addEventListener("visibilitychange", function () {
             if (!document.hidden) { try { scanRouter(); } catch (e) { /* ignore */ } }
@@ -371,14 +423,13 @@
         });
     } catch (e) { /* ignore */ }
 
-    /* ---------------------- 对外调试接口 ---------------------- */
-
     try {
         W.__M365RegionUnlock = {
-            version: "2.0.0",
+            version: "3.0.0",
             options: OPTIONS,
             status: state,
-            run: function () { return scanRouter(); }
+            run: function () { return scanRouter(); },
+            patchPayload: function (o) { return patchGraph(o); }
         };
     } catch (e) { /* ignore */ }
 })();
