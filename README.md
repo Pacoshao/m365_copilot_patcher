@@ -13,52 +13,61 @@
 
 ## 1. 区域限制解除
 
-站点现在用的是 TanStack Router，应用状态在一个 zustand store 里：
+### 当前站点是怎么拦的（2026-11-18）
 
-```
-window.__TSR_ROUTER__.state.matches[i].context.store
-```
+区域受限时，站点不再停在「Copilot Chat 不可用」页，而是**整页跳转到搜索页** `/search`。
+跳转来自 TanStack 路由守卫：hydration 阶段发现账号不合格，抛一个 307 重定向。
 
-决定区域封锁的是：
+两个曾经尝试、但都改不动的位置：
 
-| 字段 | 受限时 |
+| 位置 | 结果 |
 | --- | --- |
-| `eligibility.isCopilotEnabledRegion` | `false` |
-| `eligibility.isCopilotEligible` | `false` |
+| zustand store（`__TSR_ROUTER__`） | 出现得太晚，守卫早已跑完，改了不起作用 |
+| `window.__staticRouterHydrationData` | 实测改了照样被踢走 |
 
-命中时站点会 SPA 跳到 `/chat/blocked`。脚本从 document-start 起轮询这个 store，
-通过 `store.setState()` 把字段改成可用值，并持续兜底防止被刷回去。
+真正被守卫读取的，是 SSR 内联下发的那段 **streamed 路由载荷**：
+
+```html
+<script>self.$_TSR = {...}</script>
+<script>$_TSR.router = ($R => ($R[0] = {manifest:…, matches:…, dehydratedData:…}))(...)</script>
+```
+
+所以脚本的核心是在 `document-start` 把 `window.$_TSR` 改成访问器，
+在站点给 `router` 赋值的那一刻深挖整棵载荷对象，就地改写：
+
+| 字段 | 受限时 | 改为 |
+| --- | --- | --- |
+| `eligibility.isCopilotEnabledRegion` | `false` | `true` |
+| `eligibility.isCopilotEligible` | `false` | `true` |
+| `appsConfig.isChatEligible` 等 | `false` | `true` |
+
+守卫拿到的就已经是放行后的数据，因此**不会触发跳转**。
+
+另保留两层兜底：store 轮询（防止站点回源刷新资格后又被锁）、老的水合数据钩子。
 
 ### 左侧导航补全
 
 区域受限账号拿到的 `coreAppsContent` 只有 `Search` / `Plugins`，
 连「新建聊天」都没有——这些入口是服务端按区域资格裁剪掉的。
-脚本解锁资格后，会把缺失项按站点自己的数据结构补进 store，导航随即渲染。
-
-补齐的入口：新建聊天 `/chat`、库 `/library`、工作区 `/projects`、智能体 `/agents`。
+脚本解锁后会按站点自己的数据结构把缺失项补进 store，导航随即渲染：
+新建聊天 `/chat`、库 `/library`、工作区 `/projects`、智能体 `/agents`。
 图标全部使用线上实际存在的官方资源（逐个探测过）。
 
 两个实测出来的渲染规则：
 
 - **label 只有 1 个字符时**，站点认为它是 key，会拿 id 去查自己的本地化文案；
-  label 更长时则原样显示。所以 Projects/Library 传单字符，交给站点显示
-  「工作区」「库」。
+  label 更长时则原样显示。所以 Projects/Library 传单字符，交给站点显示「工作区」「库」。
 - **不能沿用官方 chat 的 id**（`d870f6cd-…`）：站点会认出它并套用自己的文案，
   而那份文案在当前构建下会被截成单个「新」字。换个普通 id + 显式 label 即可。
 
-补全是每次轮询都会校验的（不是只补一次），站点重新拉数据把导航刷回受限版时
-会自动补回。
+补全每次轮询都会校验，站点重新拉数据把导航刷回受限版时会自动补回。
 
-**实测结论：**
+### 实测结论
 
-- 只改 `isCopilotEnabledRegion` → 仍停在 `/chat/blocked`，聊天不可用。
-- 同时改 `isCopilotEligible` → 进入 `/home`，能正常收发消息。
-
-即区域限制纯粹是前端门槛，服务端不拦截。老脚本改的
-`window.__staticRouterHydrationData` 已无人读取（站点迁移到 TanStack Router 了）。
+- v3 在真实受限账号上稳定停在 `/home`，输入框可用，能正常收发消息。
+- 区域限制纯粹是前端门槛，服务端不拦截。
 
 ---
-
 ## 2. 记住模型选择
 
 站点**不会记住**模型选择：每次刷新、每个新会话都回到「自动」。
@@ -144,6 +153,11 @@ __CopilotModelMemory.runtime       // { applying, restored, lastSeen, clicks }
 __CopilotModelMemory.clear()       // 清除偏好
 ```
 
-微软随时可能改字段名或改成服务端校验。若失效，先看
-`__TSR_ROUTER__.state.matches[0].context.store.getState().eligibility`
-和模型选择器的 `aria-label` 是否还长这样。
+微软随时可能改字段名或改成服务端校验。若失效，按顺序看两处：
+
+1. 路由载荷是否还是 `$_TSR.router`：
+   `__M365RegionUnlock.status.lastHook` 应为 `tsr`，`payloadHits` 应大于 0。
+2. 资格字段是否还叫这些名字：
+   `__TSR_ROUTER__.state.matches[0].context.store.getState().eligibility`。
+
+模型脚本失效时，看模型选择器的 `aria-label` 是否还是「xxx，模型选择器」。
